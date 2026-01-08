@@ -75,8 +75,3 @@ To run the test harness:
 ```sh
 make test
 ```
-
-## TODO
-
-- Implement the serial transport and map CLI commands to register
-  accesses.
