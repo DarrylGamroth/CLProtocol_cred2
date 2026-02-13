@@ -33,6 +33,17 @@ cmake -S . -B build -DLIB_SUFFIX=cred2
 cmake --build build
 ```
 
+End-to-end CMake example (Release build + install):
+
+```sh
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLIB_SUFFIX=cred2 \
+  -DCMAKE_INSTALL_PREFIX=/opt/clprotocol_cred2
+cmake --build build --parallel
+cmake --install build
+```
+
 Manual command:
 
 ```sh

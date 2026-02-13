@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -fPIC -std=c++11 -I./include -I./include/genicam_include
+CXXFLAGS ?= -fPIC -std=c++11 -DCLPROTOCOL_EXPORTS -I./include -I./include/genicam_include
 LDFLAGS ?= -shared
 LIB_SUFFIX ?= cred2
 TARGET = libCLProtocol_$(LIB_SUFFIX).so

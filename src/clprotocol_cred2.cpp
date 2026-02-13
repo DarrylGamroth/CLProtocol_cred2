@@ -1,5 +1,3 @@
-#define CLPROTOCOL_EXPORTS
-
 #include "clprotocol_cred2.h"
 #include "clprotocol_cred2_xml.h"
 
