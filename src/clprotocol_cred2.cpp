@@ -18,11 +18,16 @@ static CLUINT32 g_xml_len = 0;
 static clp_logger_t g_logger = NULL;
 static CLP_LOG_LEVEL_VALUE g_log_level = CLP_LOG_NOTSET;
 
-static const CLINT8 k_device_template[] = "First Light Imaging#C-RED2";
-static const CLINT8 k_device_id[] = "First Light Imaging#C-RED2#C-RED2#Version.1.0.0#00000000";
+static const CLINT8 k_device_template[] = "FirstLightImaging#CRED2#CRED2";
+static const CLINT8 k_device_id[] = "FirstLightImaging#CRED2#CRED2#Version_1_0_0#SN00000000";
 static const CLINT8 k_xml_id[] =
-    "SchemaVersion.1.1@First Light Imaging#C-RED2#C-RED2#Version.1.0.0#00000000@XMLVersion.1.0.0";
-static const CLUINT32 k_cookie = 1;
+    "SchemaVersion.1.1@FirstLightImaging#CRED2#CRED2#Version_1_0_0#SN00000000@XMLVersion.1.0.0";
+static bool g_initialized = false;
+static CLUINT32 g_active_cookie = 0;
+static CLUINT32 g_next_cookie = 1;
+static CLUINT32 g_device_baudrate = CL_BAUDRATE_9600;
+static CLUINT32 g_supported_baudrates = CL_BAUDRATE_9600;
+static bool g_stop_probe_requested = false;
 
 struct DeviceState {
   CLUINT32 user_set_selector;
@@ -32,6 +37,53 @@ struct DeviceState {
 };
 
 static DeviceState g_state = {0, 0, 0, 0};
+
+static CLUINT32 clp_default_supported_baudrates(void) {
+  return CL_BAUDRATE_9600 | CL_BAUDRATE_19200 | CL_BAUDRATE_38400 | CL_BAUDRATE_57600 |
+         CL_BAUDRATE_115200 | CL_BAUDRATE_230400 | CL_BAUDRATE_460800 | CL_BAUDRATE_921600 |
+         CL_BAUDRATE_AUTOMAX;
+}
+
+static CLUINT32 clp_allocate_cookie(void) {
+  if (g_next_cookie == 0) {
+    g_next_cookie = 1;
+  }
+  const CLUINT32 cookie = g_next_cookie++;
+  if (g_next_cookie == 0) {
+    g_next_cookie = 1;
+  }
+  return cookie;
+}
+
+static bool clp_is_cookie_valid(const CLUINT32 cookie) {
+  return cookie != 0 && cookie == g_active_cookie;
+}
+
+static CLINT32 clp_require_cookie(const CLUINT32 cookie) {
+  if (!clp_is_cookie_valid(cookie)) {
+    g_last_error = "invalid cookie";
+    return CL_ERR_INVALID_COOKIE;
+  }
+  return CL_ERR_NO_ERR;
+}
+
+static bool clp_matches_device_id_prefix(const std::string &candidate) {
+  const std::string full_id = reinterpret_cast<const char *>(k_device_id);
+  if (candidate.empty() || candidate.size() > full_id.size()) {
+    return false;
+  }
+  if (full_id.compare(0, candidate.size(), candidate) != 0) {
+    return false;
+  }
+  if (candidate.size() == full_id.size()) {
+    return true;
+  }
+  return full_id[candidate.size()] == '#';
+}
+
+static bool clp_is_valid_baudrate_value(const CLUINT32 baudrate) {
+  return baudrate != 0 && (baudrate & (baudrate - 1)) == 0;
+}
 
 static bool clp_debug_enabled(void) {
   const char *val = getenv("CLP_DEBUG");
@@ -325,8 +377,18 @@ static std::string clp_format_float(float value) {
 
 CLPROTOCOLEXPORT CLINT32 CLPROTOCOL
 clpInitLib(clp_logger_t logger, CLP_LOG_LEVEL_VALUE logLevel) {
+  if (g_initialized) {
+    g_last_error = "library already initialized";
+    return CL_ERR_IN_USE;
+  }
+  g_initialized = true;
   g_logger = logger;
   g_log_level = logLevel;
+  g_active_cookie = 0;
+  g_device_baudrate = CL_BAUDRATE_9600;
+  g_supported_baudrates = clp_default_supported_baudrates();
+  g_stop_probe_requested = false;
+  clp_debugf("CLProtocol stub initialized");
   clp_logf(CLP_LOG_INFO, "%s", "CLProtocol stub initialized");
   return CL_ERR_NO_ERR;
 }
@@ -336,6 +398,11 @@ clpCloseLib(void) {
   free(g_xml);
   g_xml = NULL;
   g_xml_len = 0;
+  g_initialized = false;
+  g_active_cookie = 0;
+  g_device_baudrate = CL_BAUDRATE_9600;
+  g_supported_baudrates = CL_BAUDRATE_9600;
+  g_stop_probe_requested = false;
   return CL_ERR_NO_ERR;
 }
 
@@ -365,15 +432,25 @@ clpProbeDevice(ISerial *pSerial,
                CLUINT32 *pBufferSize,
                CLUINT32 *pCookie,
                const CLUINT32 TimeOut) {
-  (void)pSerial;
-  (void)pDeviceIDTemplate;
   (void)TimeOut;
 
   const CLUINT32 needed = (CLUINT32)strlen((const char *)k_device_id) + 1;
 
-  if (!pBufferSize || !pCookie) {
+  if (!pSerial || !pDeviceIDTemplate || !pBufferSize || !pCookie) {
     g_last_error = "invalid probe arguments";
     return CL_ERR_INVALID_PTR;
+  }
+
+  if (g_stop_probe_requested) {
+    g_stop_probe_requested = false;
+    g_last_error = "probe stopped";
+    return CL_ERR_TIMEOUT;
+  }
+
+  const std::string device_template = reinterpret_cast<const char *>(pDeviceIDTemplate);
+  if (!clp_matches_device_id_prefix(device_template)) {
+    g_last_error = "device template does not match";
+    return CL_ERR_NO_DEVICE_FOUND;
   }
 
   if (!pDeviceID || *pBufferSize < needed) {
@@ -381,9 +458,30 @@ clpProbeDevice(ISerial *pSerial,
     return CL_ERR_BUFFER_TOO_SMALL;
   }
 
+  CLUINT32 supported = 0;
+  CLINT32 rc = pSerial->clGetSupportedBaudRates(&supported);
+  if (rc == CL_ERR_NO_ERR && supported != 0) {
+    g_supported_baudrates = supported;
+  } else {
+    g_supported_baudrates = clp_default_supported_baudrates();
+  }
+
+  if ((g_supported_baudrates & CL_BAUDRATE_9600) == 0) {
+    g_last_error = "9600 baud unsupported";
+    return CL_ERR_BAUD_RATE_NOT_SUPPORTED;
+  }
+
+  rc = pSerial->clSetBaudRate(CL_BAUDRATE_9600);
+  if (rc != CL_ERR_NO_ERR) {
+    g_last_error = "failed to set baudrate";
+    return rc;
+  }
+
+  g_device_baudrate = CL_BAUDRATE_9600;
+  g_active_cookie = clp_allocate_cookie();
   memcpy(pDeviceID, k_device_id, needed);
   *pBufferSize = needed;
-  *pCookie = k_cookie;
+  *pCookie = g_active_cookie;
   return CL_ERR_NO_ERR;
 }
 
@@ -396,9 +494,9 @@ clpGetXMLIDs(ISerial *pSerial,
   (void)pSerial;
   (void)TimeOut;
 
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
   }
 
   if (!pBufferSize) {
@@ -428,9 +526,9 @@ clpGetXMLDescription(ISerial *pSerial,
   (void)pXMLID;
   (void)TimeOut;
 
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
   }
 
   if (!pBufferSize) {
@@ -438,7 +536,7 @@ clpGetXMLDescription(ISerial *pSerial,
     return CL_ERR_INVALID_PTR;
   }
 
-  const CLINT32 rc = clp_load_xml();
+  rc = clp_load_xml();
   if (rc != CL_ERR_NO_ERR) {
     return rc;
   }
@@ -460,9 +558,13 @@ clpReadRegister(ISerial *pSerial,
                 CLINT8 *pBuffer,
                 const CLINT64 BufferSize,
                 const CLUINT32 TimeOut) {
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
+  }
+  if (!pSerial) {
+    g_last_error = "serial interface is NULL";
+    return CL_ERR_INVALID_PTR;
   }
   if (!pBuffer || BufferSize <= 0) {
     g_last_error = "buffer is NULL";
@@ -937,9 +1039,13 @@ clpWriteRegister(ISerial *pSerial,
                  const CLINT8 *pBuffer,
                  const CLINT64 BufferSize,
                  const CLUINT32 TimeOut) {
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
+  }
+  if (!pSerial) {
+    g_last_error = "serial interface is NULL";
+    return CL_ERR_INVALID_PTR;
   }
   if (!pBuffer || BufferSize <= 0) {
     g_last_error = "buffer is NULL";
@@ -1228,9 +1334,9 @@ clpContinueWriteRegister(ISerial *pSerial,
   (void)ContinueWaiting;
   (void)TimeOut;
 
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
   }
 
   g_last_error = "continue write not implemented";
@@ -1263,10 +1369,12 @@ clpGetErrorText(CLINT32 errorCode, CLINT8 *errorText, CLUINT32 *errorTextSize, c
 
 CLPROTOCOLEXPORT CLINT32 CLPROTOCOL
 clpDisconnect(const CLUINT32 Cookie) {
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
   }
+  g_active_cookie = 0;
+  g_device_baudrate = CL_BAUDRATE_9600;
   return CL_ERR_NO_ERR;
 }
 
@@ -1276,7 +1384,7 @@ clpGetCLProtocolVersion(CLUINT32 *pVersionMajor, CLUINT32 *pVersionMinor) {
     *pVersionMajor = 1;
   }
   if (pVersionMinor) {
-    *pVersionMinor = 1;
+    *pVersionMinor = 2;
   }
   return CL_ERR_NO_ERR;
 }
@@ -1288,16 +1396,17 @@ clpGetParam(ISerial *pSerial,
             CLINT8 *pBuffer,
             const CLINT64 BufferSize,
             const CLUINT32 TimeOut) {
-  (void)pSerial;
-  (void)Cookie;
   (void)TimeOut;
 
-  if (!pBuffer || BufferSize < (CLINT64)sizeof(CLUINT32)) {
+  if (!pBuffer || BufferSize <= 0) {
     return CL_ERR_PARAM_DATA_SIZE;
   }
 
   switch (param) {
     case CLP_LOG_LEVEL: {
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
       CLUINT32 value = (CLUINT32)g_log_level;
       memcpy(pBuffer, &value, sizeof(value));
       return CL_ERR_NO_ERR;
@@ -1308,6 +1417,43 @@ clpGetParam(ISerial *pSerial,
         return CL_ERR_PARAM_DATA_SIZE;
       }
       memcpy(pBuffer, &value, sizeof(value));
+      return CL_ERR_NO_ERR;
+    }
+    case CLP_STOP_PROBE_DEVICE: {
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
+      CLUINT32 value = g_stop_probe_requested ? 1U : 0U;
+      memcpy(pBuffer, &value, sizeof(value));
+      return CL_ERR_NO_ERR;
+    }
+    case CLP_DEVICE_BAUDERATE: {
+      CLINT32 rc = clp_require_cookie(Cookie);
+      if (rc != CL_ERR_NO_ERR) {
+        return rc;
+      }
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
+      memcpy(pBuffer, &g_device_baudrate, sizeof(g_device_baudrate));
+      return CL_ERR_NO_ERR;
+    }
+    case CLP_DEVICE_SUPPORTED_BAUDERATES: {
+      CLINT32 rc = clp_require_cookie(Cookie);
+      if (rc != CL_ERR_NO_ERR) {
+        return rc;
+      }
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
+      if (pSerial) {
+        CLUINT32 supported = 0;
+        const CLINT32 supported_rc = pSerial->clGetSupportedBaudRates(&supported);
+        if (supported_rc == CL_ERR_NO_ERR && supported != 0) {
+          g_supported_baudrates = supported;
+        }
+      }
+      memcpy(pBuffer, &g_supported_baudrates, sizeof(g_supported_baudrates));
       return CL_ERR_NO_ERR;
     }
     default:
@@ -1322,16 +1468,17 @@ clpSetParam(ISerial *pSerial,
             const CLINT8 *pBuffer,
             const CLINT64 BufferSize,
             const CLUINT32 TimeOut) {
-  (void)pSerial;
-  (void)Cookie;
   (void)TimeOut;
 
-  if (!pBuffer || BufferSize < (CLINT64)sizeof(CLUINT32)) {
+  if (!pBuffer || BufferSize <= 0) {
     return CL_ERR_PARAM_DATA_SIZE;
   }
 
   switch (param) {
     case CLP_LOG_LEVEL: {
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
       CLUINT32 value = 0;
       memcpy(&value, pBuffer, sizeof(value));
       g_log_level = (CLP_LOG_LEVEL_VALUE)value;
@@ -1346,6 +1493,43 @@ clpSetParam(ISerial *pSerial,
       g_logger = (clp_logger_t)value;
       return CL_ERR_NO_ERR;
     }
+    case CLP_STOP_PROBE_DEVICE: {
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
+      CLUINT32 value = 0;
+      memcpy(&value, pBuffer, sizeof(value));
+      g_stop_probe_requested = (value != 0);
+      return CL_ERR_NO_ERR;
+    }
+    case CLP_DEVICE_BAUDERATE: {
+      CLINT32 rc = clp_require_cookie(Cookie);
+      if (rc != CL_ERR_NO_ERR) {
+        return rc;
+      }
+      if (!pSerial) {
+        return CL_ERR_INVALID_PTR;
+      }
+      if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
+        return CL_ERR_PARAM_DATA_SIZE;
+      }
+      CLUINT32 baudrate = 0;
+      memcpy(&baudrate, pBuffer, sizeof(baudrate));
+      if (!clp_is_valid_baudrate_value(baudrate)) {
+        return CL_ERR_PARAM_DATA_VALUE;
+      }
+      if ((g_supported_baudrates & baudrate) == 0) {
+        return CL_ERR_BAUD_RATE_NOT_SUPPORTED;
+      }
+      rc = pSerial->clSetBaudRate(baudrate);
+      if (rc != CL_ERR_NO_ERR) {
+        return rc;
+      }
+      g_device_baudrate = baudrate;
+      return CL_ERR_NO_ERR;
+    }
+    case CLP_DEVICE_SUPPORTED_BAUDERATES:
+      return CL_ERR_PARAM_READ_ONLY;
     default:
       return CL_ERR_PARAM_NOT_SUPPORTED;
   }
@@ -1356,6 +1540,9 @@ clpIsParamSupported(CLP_PARAMS param) {
   switch (param) {
     case CLP_LOG_LEVEL:
     case CLP_LOG_CALLBACK:
+    case CLP_STOP_PROBE_DEVICE:
+    case CLP_DEVICE_BAUDERATE:
+    case CLP_DEVICE_SUPPORTED_BAUDERATES:
       return CL_ERR_NO_ERR;
     default:
       return CL_ERR_PARAM_NOT_SUPPORTED;
@@ -1365,9 +1552,9 @@ clpIsParamSupported(CLP_PARAMS param) {
 CLPROTOCOLEXPORT CLINT32 CLPROTOCOL
 clpGetEventData(const CLUINT32 Cookie, CLINT8 *pBuffer, CLUINT32 *pBufferSize) {
   (void)pBuffer;
-  if (Cookie != k_cookie) {
-    g_last_error = "invalid cookie";
-    return CL_ERR_INVALID_COOKIE;
+  CLINT32 rc = clp_require_cookie(Cookie);
+  if (rc != CL_ERR_NO_ERR) {
+    return rc;
   }
   if (pBufferSize) {
     *pBufferSize = 0;

@@ -79,10 +79,21 @@ int main() {
 
   CLINT8 buf[8] = {};
   CLINT8 str_buf[64] = {};
-  CLUINT32 cookie = 1;
+  CLUINT32 cookie = 0;
+  CLINT8 device_id[256] = {};
+  CLUINT32 device_id_size = sizeof(device_id);
+  CLINT32 rc = clpProbeDevice(&serial,
+                              reinterpret_cast<const CLINT8 *>("FirstLightImaging#CRED2#CRED2"),
+                              device_id,
+                              &device_id_size,
+                              &cookie,
+                              100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(cookie != 0);
+  assert(std::string(device_id).find("FirstLightImaging#CRED2#CRED2") == 0);
 
   serial.reads.push("123.0\r\nfli-cli>");
-  CLINT32 rc = clpReadRegister(&serial, cookie, 0x1000, buf, sizeof(buf), 100);
+  rc = clpReadRegister(&serial, cookie, 0x1000, buf, sizeof(buf), 100);
   assert(rc == CL_ERR_NO_ERR);
   assert(read_float_from_buf(buf) == 123.0f);
   assert(serial.last_write == std::string("fps raw\n"));

@@ -57,7 +57,13 @@ g++ -fPIC -shared -o libCLProtocol_cred2.so \
 Set the environment variable so the CTI can load it:
 
 ```sh
-export EURESYS_CLPROTOCOL64_PATH=/path/to/libCLProtocol.so
+export EURESYS_CLPROTOCOL64_PATH=/path/to/libCLProtocol_cred2.so
+```
+
+If you install with `-DLIB_SUFFIX=cred2` and `CMAKE_INSTALL_PREFIX=/opt/clprotocol_cred2`, this is typically:
+
+```sh
+export EURESYS_CLPROTOCOL64_PATH=/opt/clprotocol_cred2/lib/libCLProtocol_cred2.so
 ```
 
 By default, the stub uses an embedded copy of `share/C-RED2_GenApi.xml`.
@@ -74,6 +80,26 @@ export CLP_DEBUG=1
 ```
 
 This logs CLI commands and trimmed responses to stderr.
+
+To confirm that `grablink.cti` is loading this library and calling into it:
+
+```sh
+export EURESYS_DEFAULT_GENTL_PRODUCER=grablink
+export EURESYS_CLPROTOCOL64_PATH=/path/to/libCLProtocol_cred2.so
+export CLP_DEBUG=1
+strace -f -o /tmp/gentl.strace -e trace=openat,access,getenv \
+  gentl genapi \
+    --cti=/opt/euresys/egrabber/lib/x86_64/grablink.cti \
+    --if='PC1628 - Grablink Duo (1-camera) - GDU00185' \
+    --dev=Device0 \
+    --module=remote \
+    --device-access=DEVICE_ACCESS_CUSTOM_SERIAL_COMMUNICATION \
+    --dump Root
+rg -n 'libCLProtocol|EURESYS_CLPROTOCOL64_PATH' /tmp/gentl.strace
+```
+
+`strace` confirms the library file is opened. `CLP_DEBUG=1` confirms function entry (for example,
+`clpInitLib` prints `CLProtocol stub initialized` on stderr).
 
 To regenerate the embedded XML header after editing the XML:
 
