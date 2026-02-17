@@ -125,3 +125,5 @@ To run the test harness:
 ```sh
 make test
 ```
+
+Spec traceability matrix (GenICam CLProtocol v1.2): `share/CLPROTOCOL_v1_2_COMPLIANCE.md`.

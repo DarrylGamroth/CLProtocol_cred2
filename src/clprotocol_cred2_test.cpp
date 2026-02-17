@@ -1,5 +1,6 @@
 #include "clprotocol_cred2.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -16,6 +17,8 @@ class FakeSerial : public ISerial {
   std::string last_write;
   std::queue<std::string> reads;
   bool fail_writes = false;
+  CLUINT32 supported_baudrates = CL_BAUDRATE_9600 | CL_BAUDRATE_115200;
+  std::vector<CLUINT32> set_baud_calls;
 
   CLINT32 CLPROTOCOL clSerialRead(CLINT8 *buffer, CLUINT32 *bufferSize, CLUINT32) override {
     if (!buffer || !bufferSize) {
@@ -47,11 +50,17 @@ class FakeSerial : public ISerial {
     if (!baudRates) {
       return CL_ERR_INVALID_PTR;
     }
-    *baudRates = 0;
+    *baudRates = supported_baudrates;
     return CL_ERR_NO_ERR;
   }
 
-  CLINT32 CLPROTOCOL clSetBaudRate(CLUINT32) override { return CL_ERR_NO_ERR; }
+  CLINT32 CLPROTOCOL clSetBaudRate(CLUINT32 baudRate) override {
+    set_baud_calls.push_back(baudRate);
+    if ((supported_baudrates & baudRate) == 0) {
+      return CL_ERR_BAUD_RATE_NOT_SUPPORTED;
+    }
+    return CL_ERR_NO_ERR;
+  }
 };
 
 static float read_float_from_buf(const CLINT8 *buf) {
@@ -72,10 +81,18 @@ static int read_int_from_buf(const CLINT8 *buf) {
   return static_cast<int>(bits);
 }
 
+static CLUINT32 read_u32_from_buf(const CLINT8 *buf) {
+  return static_cast<CLUINT32>(static_cast<uint8_t>(buf[0]) |
+                               (static_cast<uint8_t>(buf[1]) << 8) |
+                               (static_cast<uint8_t>(buf[2]) << 16) |
+                               (static_cast<uint8_t>(buf[3]) << 24));
+}
+
 }  // namespace
 
 int main() {
   FakeSerial serial;
+  FakeSerial serial2;
 
   CLINT8 buf[8] = {};
   CLINT8 str_buf[64] = {};
@@ -90,7 +107,91 @@ int main() {
                               100);
   assert(rc == CL_ERR_NO_ERR);
   assert(cookie != 0);
-  assert(std::string(device_id).find("FirstLightImaging#CRED2#CRED2") == 0);
+  assert(!serial.set_baud_calls.empty());
+  assert(serial.set_baud_calls.back() == CL_BAUDRATE_9600);
+
+  const std::string device_id_str(device_id);
+  assert(device_id_str.find("libCLProtocol_cred2.so#FirstLightImaging#CRED2#CRED2") != std::string::npos);
+  assert(device_id_str.find("#Version_1_0_0#SN00000000") != std::string::npos);
+
+  CLINT8 reconnect_device_id[256] = {};
+  CLUINT32 reconnect_device_id_size = sizeof(reconnect_device_id);
+  CLUINT32 reconnect_cookie = 0;
+  rc = clpProbeDevice(&serial,
+                      reinterpret_cast<const CLINT8 *>(device_id_str.c_str()),
+                      reconnect_device_id,
+                      &reconnect_device_id_size,
+                      &reconnect_cookie,
+                      100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(reconnect_cookie != 0);
+  assert(reconnect_cookie != cookie);
+  assert(std::string(reconnect_device_id) == device_id_str);
+  rc = clpDisconnect(reconnect_cookie);
+  assert(rc == CL_ERR_NO_ERR);
+
+  CLINT8 xml_id_buf[512] = {};
+  CLUINT32 xml_id_buf_size = sizeof(xml_id_buf);
+  rc = clpGetXMLIDs(&serial, cookie, xml_id_buf, &xml_id_buf_size, 100);
+  assert(rc == CL_ERR_NO_ERR);
+  const std::string xml_id(xml_id_buf);
+  assert(xml_id.find("SchemaVersion.1.1@") == 0);
+  assert(xml_id.find("@" + device_id_str + "@") != std::string::npos);
+
+  CLINT8 unknown_xml[] = "SchemaVersion.1.1@Unknown@XMLVersion.1.0.0";
+  CLUINT32 xml_size = 0;
+  rc = clpGetXMLDescription(&serial, cookie, unknown_xml, NULL, &xml_size, 100);
+  assert(rc == CL_ERR_NO_XMLDESCRIPTION_FOUND);
+
+  rc = clpGetXMLDescription(&serial,
+                            cookie,
+                            reinterpret_cast<const CLINT8 *>(xml_id.c_str()),
+                            NULL,
+                            &xml_size,
+                            100);
+  assert(rc == CL_ERR_BUFFER_TOO_SMALL);
+  assert(xml_size > 0);
+
+  std::vector<CLINT8> xml_data(xml_size);
+  rc = clpGetXMLDescription(&serial,
+                            cookie,
+                            reinterpret_cast<const CLINT8 *>(xml_id.c_str()),
+                            xml_data.data(),
+                            &xml_size,
+                            100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(xml_size == xml_data.size());
+
+  CLINT8 device_id2[256] = {};
+  CLUINT32 device_id2_size = sizeof(device_id2);
+  CLUINT32 cookie2 = 0;
+  rc = clpProbeDevice(&serial2,
+                      reinterpret_cast<const CLINT8 *>("FirstLightImaging#CRED2#CRED2"),
+                      device_id2,
+                      &device_id2_size,
+                      &cookie2,
+                      100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(cookie2 != 0);
+  assert(cookie2 != cookie);
+
+  CLINT8 param_buf[sizeof(CLUINT32)] = {};
+  CLUINT32 baudrate = CL_BAUDRATE_115200;
+  memcpy(param_buf, &baudrate, sizeof(baudrate));
+  rc = clpSetParam(&serial, CLP_DEVICE_BAUDERATE, cookie, param_buf, sizeof(param_buf), 100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(!serial.set_baud_calls.empty());
+  assert(serial.set_baud_calls.back() == CL_BAUDRATE_115200);
+
+  memset(param_buf, 0, sizeof(param_buf));
+  rc = clpGetParam(&serial, CLP_DEVICE_BAUDERATE, cookie, param_buf, sizeof(param_buf), 100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(read_u32_from_buf(param_buf) == CL_BAUDRATE_115200);
+
+  memset(param_buf, 0, sizeof(param_buf));
+  rc = clpGetParam(&serial2, CLP_DEVICE_BAUDERATE, cookie2, param_buf, sizeof(param_buf), 100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(read_u32_from_buf(param_buf) == CL_BAUDRATE_9600);
 
   serial.reads.push("123.0\r\nfli-cli>");
   rc = clpReadRegister(&serial, cookie, 0x1000, buf, sizeof(buf), 100);
@@ -208,6 +309,9 @@ int main() {
   rc = clpReadRegister(&serial, cookie, 0x2100, buf, sizeof(buf), 100);
   assert(rc == CL_ERR_NO_ERR);
   assert(read_int_from_buf(buf) == 3);
+  rc = clpReadRegister(&serial2, cookie2, 0x2100, buf, sizeof(buf), 100);
+  assert(rc == CL_ERR_NO_ERR);
+  assert(read_int_from_buf(buf) == 0);
 
   FakeSerial failing_serial;
   failing_serial.fail_writes = true;
@@ -235,6 +339,13 @@ int main() {
   rc = clpReadRegister(&serial, cookie, 0x3180, lic_buf, sizeof(lic_buf), 100);
   assert(rc == CL_ERR_NO_ERR);
   assert(std::string(reinterpret_cast<char *>(lic_buf)).find("licenseA.lic") != std::string::npos);
+
+  rc = clpDisconnect(cookie2);
+  assert(rc == CL_ERR_NO_ERR);
+  rc = clpDisconnect(cookie);
+  assert(rc == CL_ERR_NO_ERR);
+  rc = clpDisconnect(cookie);
+  assert(rc == CL_ERR_INVALID_COOKIE);
 
   std::cout << "clprotocol_cred2_test OK\n";
   return 0;

@@ -18,15 +18,33 @@ static CLUINT32 g_xml_len = 0;
 static clp_logger_t g_logger = NULL;
 static CLP_LOG_LEVEL_VALUE g_log_level = CLP_LOG_NOTSET;
 
-static const CLINT8 k_device_template[] = "FirstLightImaging#CRED2#CRED2";
-static const CLINT8 k_device_id[] = "FirstLightImaging#CRED2#CRED2#Version_1_0_0#SN00000000";
-static const CLINT8 k_xml_id[] =
-    "SchemaVersion.1.1@FirstLightImaging#CRED2#CRED2#Version_1_0_0#SN00000000@XMLVersion.1.0.0";
+#ifndef CLP_LIB_SUFFIX
+#define CLP_LIB_SUFFIX "cred2"
+#endif
+
+#ifndef CLP_PLATFORM_SUBDIR
+#if defined(_WIN64)
+#define CLP_PLATFORM_SUBDIR "Win64_x64"
+#elif defined(_WIN32)
+#define CLP_PLATFORM_SUBDIR "Win32_i86"
+#elif defined(__x86_64__) || defined(__aarch64__)
+#define CLP_PLATFORM_SUBDIR "Linux64_x64"
+#else
+#define CLP_PLATFORM_SUBDIR "Linux32_i86"
+#endif
+#endif
+
+static const CLINT8 k_short_device_template[] = "FirstLightImaging#CRED2#CRED2";
+static const CLINT8 k_camera_manufacturer[] = "FirstLightImaging";
+static const CLINT8 k_camera_family[] = "CRED2";
+static const CLINT8 k_camera_model[] = "CRED2";
+static const CLINT8 k_camera_version[] = "Version_1_0_0";
+static const CLINT8 k_camera_serial[] = "SN00000000";
+static const CLINT8 k_xml_schema_version[] = "SchemaVersion.1.1";
+static const CLINT8 k_xml_version[] = "XMLVersion.1.0.0";
+
 static bool g_initialized = false;
-static CLUINT32 g_active_cookie = 0;
 static CLUINT32 g_next_cookie = 1;
-static CLUINT32 g_device_baudrate = CL_BAUDRATE_9600;
-static CLUINT32 g_supported_baudrates = CL_BAUDRATE_9600;
 static bool g_stop_probe_requested = false;
 
 struct DeviceState {
@@ -36,7 +54,16 @@ struct DeviceState {
   CLUINT32 indicator_selector;
 };
 
-static DeviceState g_state = {0, 0, 0, 0};
+struct ConnectionState {
+  CLUINT32 cookie;
+  CLUINT32 device_baudrate;
+  CLUINT32 supported_baudrates;
+  DeviceState state;
+  std::string device_id;
+  std::string xml_id;
+};
+
+static std::vector<ConnectionState> g_connections;
 
 static CLUINT32 clp_default_supported_baudrates(void) {
   return CL_BAUDRATE_9600 | CL_BAUDRATE_19200 | CL_BAUDRATE_38400 | CL_BAUDRATE_57600 |
@@ -44,41 +71,134 @@ static CLUINT32 clp_default_supported_baudrates(void) {
          CL_BAUDRATE_AUTOMAX;
 }
 
+static std::string clp_join_path(const std::string &left, const std::string &right) {
+  if (left.empty()) {
+    return right;
+  }
+  if (right.empty()) {
+    return left;
+  }
+  const char last = left[left.size() - 1];
+  if (last == '/' || last == '\\') {
+    return left + right;
+  }
+  return left + "/" + right;
+}
+
+static std::string clp_driver_directory_token(void) {
+  const char *root = getenv("GENICAM_CLPROTOCOL");
+  if (root && root[0] != '\0') {
+    return clp_join_path(root, CLP_PLATFORM_SUBDIR);
+  }
+  return std::string("$(GENICAM_CLPROTOCOL)/") + CLP_PLATFORM_SUBDIR;
+}
+
+static std::string clp_driver_filename_token(void) {
+#if defined(_WIN32)
+  return std::string("CLProtocol_") + CLP_LIB_SUFFIX + ".dll";
+#else
+  return std::string("libCLProtocol_") + CLP_LIB_SUFFIX + ".so";
+#endif
+}
+
+static std::string clp_short_device_id(void) {
+  return std::string(reinterpret_cast<const char *>(k_camera_manufacturer)) + "#" +
+         reinterpret_cast<const char *>(k_camera_family) + "#" +
+         reinterpret_cast<const char *>(k_camera_model) + "#" +
+         reinterpret_cast<const char *>(k_camera_version) + "#" +
+         reinterpret_cast<const char *>(k_camera_serial);
+}
+
+static std::string clp_full_device_id(void) {
+  return clp_driver_directory_token() + "#" + clp_driver_filename_token() + "#" + clp_short_device_id();
+}
+
+static std::string clp_xml_id_for_device(const std::string &device_id) {
+  return std::string(reinterpret_cast<const char *>(k_xml_schema_version)) + "@" + device_id + "@" +
+         reinterpret_cast<const char *>(k_xml_version);
+}
+
+static std::vector<std::string> clp_split_by_char(const std::string &value, char separator) {
+  std::vector<std::string> parts;
+  size_t offset = 0;
+  while (offset <= value.size()) {
+    const size_t pos = value.find(separator, offset);
+    if (pos == std::string::npos) {
+      parts.push_back(value.substr(offset));
+      break;
+    }
+    parts.push_back(value.substr(offset, pos - offset));
+    offset = pos + 1;
+  }
+  return parts;
+}
+
+static bool clp_is_token_prefix(const std::vector<std::string> &candidate,
+                                const std::vector<std::string> &target) {
+  if (candidate.empty() || candidate.size() > target.size()) {
+    return false;
+  }
+  for (size_t index = 0; index < candidate.size(); ++index) {
+    if (candidate[index] != target[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool clp_matches_device_template(const std::string &template_or_device_id,
+                                        const std::string &full_device_id,
+                                        const std::string &short_device_id) {
+  const std::vector<std::string> candidates = clp_split_by_char(template_or_device_id, '\t');
+  const std::vector<std::string> full_tokens = clp_split_by_char(full_device_id, '#');
+  const std::vector<std::string> short_tokens = clp_split_by_char(short_device_id, '#');
+  for (size_t idx = 0; idx < candidates.size(); ++idx) {
+    if (candidates[idx].empty()) {
+      continue;
+    }
+    const std::vector<std::string> candidate_tokens = clp_split_by_char(candidates[idx], '#');
+    if (clp_is_token_prefix(candidate_tokens, full_tokens) ||
+        clp_is_token_prefix(candidate_tokens, short_tokens)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static ConnectionState *clp_find_connection(const CLUINT32 cookie) {
+  if (cookie == 0) {
+    return NULL;
+  }
+  for (size_t idx = 0; idx < g_connections.size(); ++idx) {
+    if (g_connections[idx].cookie == cookie) {
+      return &g_connections[idx];
+    }
+  }
+  return NULL;
+}
+
 static CLUINT32 clp_allocate_cookie(void) {
-  if (g_next_cookie == 0) {
-    g_next_cookie = 1;
+  for (;;) {
+    if (g_next_cookie == 0) {
+      g_next_cookie = 1;
+    }
+    const CLUINT32 cookie = g_next_cookie++;
+    if (clp_find_connection(cookie) == NULL) {
+      return cookie;
+    }
   }
-  const CLUINT32 cookie = g_next_cookie++;
-  if (g_next_cookie == 0) {
-    g_next_cookie = 1;
-  }
-  return cookie;
 }
 
-static bool clp_is_cookie_valid(const CLUINT32 cookie) {
-  return cookie != 0 && cookie == g_active_cookie;
-}
-
-static CLINT32 clp_require_cookie(const CLUINT32 cookie) {
-  if (!clp_is_cookie_valid(cookie)) {
+static CLINT32 clp_require_cookie(const CLUINT32 cookie, ConnectionState **connection = NULL) {
+  ConnectionState *state = clp_find_connection(cookie);
+  if (!state) {
     g_last_error = "invalid cookie";
     return CL_ERR_INVALID_COOKIE;
   }
+  if (connection) {
+    *connection = state;
+  }
   return CL_ERR_NO_ERR;
-}
-
-static bool clp_matches_device_id_prefix(const std::string &candidate) {
-  const std::string full_id = reinterpret_cast<const char *>(k_device_id);
-  if (candidate.empty() || candidate.size() > full_id.size()) {
-    return false;
-  }
-  if (full_id.compare(0, candidate.size(), candidate) != 0) {
-    return false;
-  }
-  if (candidate.size() == full_id.size()) {
-    return true;
-  }
-  return full_id[candidate.size()] == '#';
 }
 
 static bool clp_is_valid_baudrate_value(const CLUINT32 baudrate) {
@@ -384,9 +504,7 @@ clpInitLib(clp_logger_t logger, CLP_LOG_LEVEL_VALUE logLevel) {
   g_initialized = true;
   g_logger = logger;
   g_log_level = logLevel;
-  g_active_cookie = 0;
-  g_device_baudrate = CL_BAUDRATE_9600;
-  g_supported_baudrates = clp_default_supported_baudrates();
+  g_connections.clear();
   g_stop_probe_requested = false;
   clp_debugf("CLProtocol stub initialized");
   clp_logf(CLP_LOG_INFO, "%s", "CLProtocol stub initialized");
@@ -399,16 +517,14 @@ clpCloseLib(void) {
   g_xml = NULL;
   g_xml_len = 0;
   g_initialized = false;
-  g_active_cookie = 0;
-  g_device_baudrate = CL_BAUDRATE_9600;
-  g_supported_baudrates = CL_BAUDRATE_9600;
+  g_connections.clear();
   g_stop_probe_requested = false;
   return CL_ERR_NO_ERR;
 }
 
 CLPROTOCOLEXPORT CLINT32 CLPROTOCOL
 clpGetShortDeviceIDTemplates(CLINT8 *pShortDeviceTemplates, CLUINT32 *pBufferSize) {
-  const CLUINT32 needed = (CLUINT32)strlen((const char *)k_device_template) + 1;
+  const CLUINT32 needed = (CLUINT32)strlen((const char *)k_short_device_template) + 1;
 
   if (!pBufferSize) {
     g_last_error = "buffer size is NULL";
@@ -420,7 +536,7 @@ clpGetShortDeviceIDTemplates(CLINT8 *pShortDeviceTemplates, CLUINT32 *pBufferSiz
     return CL_ERR_BUFFER_TOO_SMALL;
   }
 
-  memcpy(pShortDeviceTemplates, k_device_template, needed);
+  memcpy(pShortDeviceTemplates, k_short_device_template, needed);
   *pBufferSize = needed;
   return CL_ERR_NO_ERR;
 }
@@ -434,8 +550,6 @@ clpProbeDevice(ISerial *pSerial,
                const CLUINT32 TimeOut) {
   (void)TimeOut;
 
-  const CLUINT32 needed = (CLUINT32)strlen((const char *)k_device_id) + 1;
-
   if (!pSerial || !pDeviceIDTemplate || !pBufferSize || !pCookie) {
     g_last_error = "invalid probe arguments";
     return CL_ERR_INVALID_PTR;
@@ -448,11 +562,14 @@ clpProbeDevice(ISerial *pSerial,
   }
 
   const std::string device_template = reinterpret_cast<const char *>(pDeviceIDTemplate);
-  if (!clp_matches_device_id_prefix(device_template)) {
+  const std::string full_device_id = clp_full_device_id();
+  const std::string short_device_id = clp_short_device_id();
+  if (!clp_matches_device_template(device_template, full_device_id, short_device_id)) {
     g_last_error = "device template does not match";
-    return CL_ERR_NO_DEVICE_FOUND;
+    return CL_ERR_INVALID_DEVICEID;
   }
 
+  const CLUINT32 needed = static_cast<CLUINT32>(full_device_id.size() + 1);
   if (!pDeviceID || *pBufferSize < needed) {
     *pBufferSize = needed;
     return CL_ERR_BUFFER_TOO_SMALL;
@@ -460,13 +577,11 @@ clpProbeDevice(ISerial *pSerial,
 
   CLUINT32 supported = 0;
   CLINT32 rc = pSerial->clGetSupportedBaudRates(&supported);
-  if (rc == CL_ERR_NO_ERR && supported != 0) {
-    g_supported_baudrates = supported;
-  } else {
-    g_supported_baudrates = clp_default_supported_baudrates();
+  if (rc != CL_ERR_NO_ERR || supported == 0) {
+    supported = clp_default_supported_baudrates();
   }
 
-  if ((g_supported_baudrates & CL_BAUDRATE_9600) == 0) {
+  if ((supported & CL_BAUDRATE_9600) == 0) {
     g_last_error = "9600 baud unsupported";
     return CL_ERR_BAUD_RATE_NOT_SUPPORTED;
   }
@@ -477,11 +592,18 @@ clpProbeDevice(ISerial *pSerial,
     return rc;
   }
 
-  g_device_baudrate = CL_BAUDRATE_9600;
-  g_active_cookie = clp_allocate_cookie();
-  memcpy(pDeviceID, k_device_id, needed);
+  ConnectionState state = {};
+  state.cookie = clp_allocate_cookie();
+  state.device_baudrate = CL_BAUDRATE_9600;
+  state.supported_baudrates = supported;
+  state.state = {0, 0, 0, 0};
+  state.device_id = full_device_id;
+  state.xml_id = clp_xml_id_for_device(full_device_id);
+  g_connections.push_back(state);
+
+  memcpy(pDeviceID, state.device_id.c_str(), needed);
   *pBufferSize = needed;
-  *pCookie = g_active_cookie;
+  *pCookie = state.cookie;
   return CL_ERR_NO_ERR;
 }
 
@@ -494,7 +616,8 @@ clpGetXMLIDs(ISerial *pSerial,
   (void)pSerial;
   (void)TimeOut;
 
-  CLINT32 rc = clp_require_cookie(Cookie);
+  ConnectionState *connection = NULL;
+  CLINT32 rc = clp_require_cookie(Cookie, &connection);
   if (rc != CL_ERR_NO_ERR) {
     return rc;
   }
@@ -504,13 +627,13 @@ clpGetXMLIDs(ISerial *pSerial,
     return CL_ERR_INVALID_PTR;
   }
 
-  const CLUINT32 needed = (CLUINT32)strlen((const char *)k_xml_id) + 1;
+  const CLUINT32 needed = static_cast<CLUINT32>(connection->xml_id.size() + 1);
   if (!pXMLIDs || *pBufferSize < needed) {
     *pBufferSize = needed;
     return CL_ERR_BUFFER_TOO_SMALL;
   }
 
-  memcpy(pXMLIDs, k_xml_id, needed);
+  memcpy(pXMLIDs, connection->xml_id.c_str(), needed);
   *pBufferSize = needed;
   return CL_ERR_NO_ERR;
 }
@@ -523,12 +646,21 @@ clpGetXMLDescription(ISerial *pSerial,
                      CLUINT32 *pBufferSize,
                      const CLUINT32 TimeOut) {
   (void)pSerial;
-  (void)pXMLID;
   (void)TimeOut;
 
-  CLINT32 rc = clp_require_cookie(Cookie);
+  ConnectionState *connection = NULL;
+  CLINT32 rc = clp_require_cookie(Cookie, &connection);
   if (rc != CL_ERR_NO_ERR) {
     return rc;
+  }
+
+  if (!pXMLID) {
+    g_last_error = "XML ID is NULL";
+    return CL_ERR_INVALID_PTR;
+  }
+  if (connection->xml_id != reinterpret_cast<const char *>(pXMLID)) {
+    g_last_error = "XML ID does not match connected device";
+    return CL_ERR_NO_XMLDESCRIPTION_FOUND;
   }
 
   if (!pBufferSize) {
@@ -558,10 +690,12 @@ clpReadRegister(ISerial *pSerial,
                 CLINT8 *pBuffer,
                 const CLINT64 BufferSize,
                 const CLUINT32 TimeOut) {
-  CLINT32 rc = clp_require_cookie(Cookie);
+  ConnectionState *connection = NULL;
+  CLINT32 rc = clp_require_cookie(Cookie, &connection);
   if (rc != CL_ERR_NO_ERR) {
     return rc;
   }
+  DeviceState &state = connection->state;
   if (!pSerial) {
     g_last_error = "serial interface is NULL";
     return CL_ERR_INVALID_PTR;
@@ -682,7 +816,7 @@ clpReadRegister(ISerial *pSerial,
       return CL_ERR_NO_ERR;
     }
     case 0x0310:
-      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(g_state.indicator_selector));
+      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(state.indicator_selector));
     case 0x0314: {
       CLINT32 value = 0;
       std::string out;
@@ -885,11 +1019,11 @@ clpReadRegister(ISerial *pSerial,
       return clp_write_int32(pBuffer, BufferSize, value);
     }
     case 0x2000:
-      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(g_state.temperature_selector));
+      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(state.temperature_selector));
     case 0x2004: {
       float value = 0.0f;
       const char *cmd = "temperatures raw";
-      switch (g_state.temperature_selector) {
+      switch (state.temperature_selector) {
         case 0:
           cmd = "temperatures motherboard raw";
           break;
@@ -920,7 +1054,7 @@ clpReadRegister(ISerial *pSerial,
       return clp_write_float32(pBuffer, BufferSize, value);
     }
     case 0x2100:
-      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(g_state.user_set_selector));
+      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(state.user_set_selector));
     case 0x2200: {
       CLINT32 value = 0;
       std::string out;
@@ -931,11 +1065,11 @@ clpReadRegister(ISerial *pSerial,
       return clp_write_int32(pBuffer, BufferSize, value);
     }
     case 0x3000:
-      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(g_state.power_selector));
+      return clp_write_int32(pBuffer, BufferSize, static_cast<CLINT32>(state.power_selector));
     case 0x3004: {
       float value = 0.0f;
       const char *cmd = "power raw";
-      switch (g_state.power_selector) {
+      switch (state.power_selector) {
         case 0:
           cmd = "power raw";
           break;
@@ -1039,10 +1173,12 @@ clpWriteRegister(ISerial *pSerial,
                  const CLINT8 *pBuffer,
                  const CLINT64 BufferSize,
                  const CLUINT32 TimeOut) {
-  CLINT32 rc = clp_require_cookie(Cookie);
+  ConnectionState *connection = NULL;
+  CLINT32 rc = clp_require_cookie(Cookie, &connection);
   if (rc != CL_ERR_NO_ERR) {
     return rc;
   }
+  DeviceState &state = connection->state;
   if (!pSerial) {
     g_last_error = "serial interface is NULL";
     return CL_ERR_INVALID_PTR;
@@ -1071,7 +1207,7 @@ clpWriteRegister(ISerial *pSerial,
       CLINT32 value = 0;
       CLINT32 rc = clp_read_int32(pBuffer, BufferSize, &value);
       if (rc != CL_ERR_NO_ERR) return rc;
-      g_state.indicator_selector = static_cast<CLUINT32>(value);
+      state.indicator_selector = static_cast<CLUINT32>(value);
       return CL_ERR_NO_ERR;
     }
     case 0x0314: {
@@ -1215,18 +1351,18 @@ clpWriteRegister(ISerial *pSerial,
       CLINT32 value = 0;
       CLINT32 rc = clp_read_int32(pBuffer, BufferSize, &value);
       if (rc != CL_ERR_NO_ERR) return rc;
-      g_state.temperature_selector = static_cast<CLUINT32>(value);
+      state.temperature_selector = static_cast<CLUINT32>(value);
       return CL_ERR_NO_ERR;
     }
     case 0x2100: {
       CLINT32 value = 0;
       CLINT32 rc = clp_read_int32(pBuffer, BufferSize, &value);
       if (rc != CL_ERR_NO_ERR) return rc;
-      g_state.user_set_selector = static_cast<CLUINT32>(value);
+      state.user_set_selector = static_cast<CLUINT32>(value);
       return CL_ERR_NO_ERR;
     }
     case 0x2104: {
-      std::string cmd = "set preset " + clp_format_int(static_cast<CLINT32>(g_state.user_set_selector));
+      std::string cmd = "set preset " + clp_format_int(static_cast<CLINT32>(state.user_set_selector));
       return send_cmd(cmd);
     }
     case 0x2108:
@@ -1242,7 +1378,7 @@ clpWriteRegister(ISerial *pSerial,
       CLINT32 value = 0;
       CLINT32 rc = clp_read_int32(pBuffer, BufferSize, &value);
       if (rc != CL_ERR_NO_ERR) return rc;
-      g_state.power_selector = static_cast<CLUINT32>(value);
+      state.power_selector = static_cast<CLUINT32>(value);
       return CL_ERR_NO_ERR;
     }
     case 0x3010: {
@@ -1369,13 +1505,14 @@ clpGetErrorText(CLINT32 errorCode, CLINT8 *errorText, CLUINT32 *errorTextSize, c
 
 CLPROTOCOLEXPORT CLINT32 CLPROTOCOL
 clpDisconnect(const CLUINT32 Cookie) {
-  CLINT32 rc = clp_require_cookie(Cookie);
-  if (rc != CL_ERR_NO_ERR) {
-    return rc;
+  for (size_t idx = 0; idx < g_connections.size(); ++idx) {
+    if (g_connections[idx].cookie == Cookie) {
+      g_connections.erase(g_connections.begin() + idx);
+      return CL_ERR_NO_ERR;
+    }
   }
-  g_active_cookie = 0;
-  g_device_baudrate = CL_BAUDRATE_9600;
-  return CL_ERR_NO_ERR;
+  g_last_error = "invalid cookie";
+  return CL_ERR_INVALID_COOKIE;
 }
 
 CLPROTOCOLEXPORT CLINT32 CLPROTOCOL
@@ -1428,18 +1565,20 @@ clpGetParam(ISerial *pSerial,
       return CL_ERR_NO_ERR;
     }
     case CLP_DEVICE_BAUDERATE: {
-      CLINT32 rc = clp_require_cookie(Cookie);
+      ConnectionState *connection = NULL;
+      CLINT32 rc = clp_require_cookie(Cookie, &connection);
       if (rc != CL_ERR_NO_ERR) {
         return rc;
       }
       if (BufferSize < (CLINT64)sizeof(CLUINT32)) {
         return CL_ERR_PARAM_DATA_SIZE;
       }
-      memcpy(pBuffer, &g_device_baudrate, sizeof(g_device_baudrate));
+      memcpy(pBuffer, &connection->device_baudrate, sizeof(connection->device_baudrate));
       return CL_ERR_NO_ERR;
     }
     case CLP_DEVICE_SUPPORTED_BAUDERATES: {
-      CLINT32 rc = clp_require_cookie(Cookie);
+      ConnectionState *connection = NULL;
+      CLINT32 rc = clp_require_cookie(Cookie, &connection);
       if (rc != CL_ERR_NO_ERR) {
         return rc;
       }
@@ -1450,10 +1589,10 @@ clpGetParam(ISerial *pSerial,
         CLUINT32 supported = 0;
         const CLINT32 supported_rc = pSerial->clGetSupportedBaudRates(&supported);
         if (supported_rc == CL_ERR_NO_ERR && supported != 0) {
-          g_supported_baudrates = supported;
+          connection->supported_baudrates = supported;
         }
       }
-      memcpy(pBuffer, &g_supported_baudrates, sizeof(g_supported_baudrates));
+      memcpy(pBuffer, &connection->supported_baudrates, sizeof(connection->supported_baudrates));
       return CL_ERR_NO_ERR;
     }
     default:
@@ -1503,7 +1642,8 @@ clpSetParam(ISerial *pSerial,
       return CL_ERR_NO_ERR;
     }
     case CLP_DEVICE_BAUDERATE: {
-      CLINT32 rc = clp_require_cookie(Cookie);
+      ConnectionState *connection = NULL;
+      CLINT32 rc = clp_require_cookie(Cookie, &connection);
       if (rc != CL_ERR_NO_ERR) {
         return rc;
       }
@@ -1518,14 +1658,22 @@ clpSetParam(ISerial *pSerial,
       if (!clp_is_valid_baudrate_value(baudrate)) {
         return CL_ERR_PARAM_DATA_VALUE;
       }
-      if ((g_supported_baudrates & baudrate) == 0) {
+      if (connection->supported_baudrates == 0) {
+        connection->supported_baudrates = clp_default_supported_baudrates();
+      }
+      CLUINT32 supported = 0;
+      const CLINT32 supported_rc = pSerial->clGetSupportedBaudRates(&supported);
+      if (supported_rc == CL_ERR_NO_ERR && supported != 0) {
+        connection->supported_baudrates = supported;
+      }
+      if ((connection->supported_baudrates & baudrate) == 0) {
         return CL_ERR_BAUD_RATE_NOT_SUPPORTED;
       }
       rc = pSerial->clSetBaudRate(baudrate);
       if (rc != CL_ERR_NO_ERR) {
         return rc;
       }
-      g_device_baudrate = baudrate;
+      connection->device_baudrate = baudrate;
       return CL_ERR_NO_ERR;
     }
     case CLP_DEVICE_SUPPORTED_BAUDERATES:

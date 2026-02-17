@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -fPIC -std=c++11 -DCLPROTOCOL_EXPORTS -I./include -I./include/genicam_include
+CXXFLAGS ?= -fPIC -std=c++11 -DCLPROTOCOL_EXPORTS -DCLP_LIB_SUFFIX=\"$(LIB_SUFFIX)\" -DCLP_PLATFORM_SUBDIR=\"$(CLPROTOCOL_PLATFORM_SUBDIR)\" -I./include -I./include/genicam_include
 LDFLAGS ?= -shared
 LIB_SUFFIX ?= cred2
 TARGET = libCLProtocol_$(LIB_SUFFIX).so
@@ -29,6 +29,7 @@ install: $(TARGET)
 	@cp -f "$(TARGET)" "$(DESTDIR)/$(CLPROTOCOL_PLATFORM_SUBDIR)/"
 	@cp -f "share/C-RED2_GenApi.xml" "$(DESTDIR)/"
 	@cp -f "share/C-RED2_SFNC_MAPPING.md" "$(DESTDIR)/"
+	@cp -f "share/CLPROTOCOL_v1_2_COMPLIANCE.md" "$(DESTDIR)/"
 	@cp -f "include/clprotocol_cred2_xml.h" "$(DESTDIR)/"
 	@cp -f "scripts/gen_embed_xml.sh" "$(DESTDIR)/bin/"
 	@echo "Installed $(TARGET) to $(DESTDIR)/$(CLPROTOCOL_PLATFORM_SUBDIR)"

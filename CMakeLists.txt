@@ -31,7 +31,11 @@ target_include_directories(CLProtocol PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include
   ${CMAKE_CURRENT_SOURCE_DIR}/include/genicam_include
 )
-target_compile_definitions(CLProtocol PRIVATE CLPROTOCOL_EXPORTS)
+target_compile_definitions(CLProtocol PRIVATE
+  CLPROTOCOL_EXPORTS
+  CLP_LIB_SUFFIX="${LIB_SUFFIX}"
+  CLP_PLATFORM_SUBDIR="${CLPROTOCOL_PLATFORM_SUBDIR}"
+)
 set_target_properties(CLProtocol PROPERTIES OUTPUT_NAME "CLProtocol_${LIB_SUFFIX}")
 
 add_custom_target(embed
@@ -48,6 +52,7 @@ install(TARGETS CLProtocol
 install(FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/share/C-RED2_GenApi.xml
   ${CMAKE_CURRENT_SOURCE_DIR}/share/C-RED2_SFNC_MAPPING.md
+  ${CMAKE_CURRENT_SOURCE_DIR}/share/CLPROTOCOL_v1_2_COMPLIANCE.md
   ${CMAKE_CURRENT_SOURCE_DIR}/include/clprotocol_cred2_xml.h
   DESTINATION .
 )
