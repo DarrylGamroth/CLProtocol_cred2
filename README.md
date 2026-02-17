@@ -44,6 +44,13 @@ cmake --build build --parallel
 cmake --install build
 ```
 
+This install layout follows the CLProtocol standard (v1.2, page 4):
+
+```text
+/opt/clprotocol_cred2/                  # CLProtocol root location
+/opt/clprotocol_cred2/Linux64_x64/      # protocol driver libraries on Linux 64-bit
+```
+
 Manual command:
 
 ```sh
@@ -63,7 +70,13 @@ export EURESYS_CLPROTOCOL64_PATH=/path/to/libCLProtocol_cred2.so
 If you install with `-DLIB_SUFFIX=cred2` and `CMAKE_INSTALL_PREFIX=/opt/clprotocol_cred2`, this is typically:
 
 ```sh
-export EURESYS_CLPROTOCOL64_PATH=/opt/clprotocol_cred2/lib/libCLProtocol_cred2.so
+export EURESYS_CLPROTOCOL64_PATH=/opt/clprotocol_cred2/Linux64_x64/libCLProtocol_cred2.so
+```
+
+Per the CLProtocol standard registration model, set the CLProtocol root location in:
+
+```sh
+export GENICAM_CLPROTOCOL=/opt/clprotocol_cred2
 ```
 
 By default, the stub uses an embedded copy of `share/C-RED2_GenApi.xml`.

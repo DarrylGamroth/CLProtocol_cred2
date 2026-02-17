@@ -3,6 +3,7 @@ CXXFLAGS ?= -fPIC -std=c++11 -DCLPROTOCOL_EXPORTS -I./include -I./include/genica
 LDFLAGS ?= -shared
 LIB_SUFFIX ?= cred2
 TARGET = libCLProtocol_$(LIB_SUFFIX).so
+CLPROTOCOL_PLATFORM_SUBDIR ?= Linux64_x64
 EMBED_SCRIPT = ./scripts/gen_embed_xml.sh
 SRC = src/clprotocol_cred2.cpp
 TEST_SRC = src/clprotocol_cred2_test.cpp
@@ -24,13 +25,13 @@ install: $(TARGET)
 		echo "Set DESTDIR to the install directory, e.g. make install DESTDIR=/opt/clprotocol"; \
 		exit 1; \
 	fi
-	@mkdir -p "$(DESTDIR)/lib" "$(DESTDIR)/share" "$(DESTDIR)/bin"
-	@cp -f "$(TARGET)" "$(DESTDIR)/lib/"
-	@cp -f "share/C-RED2_GenApi.xml" "$(DESTDIR)/share/"
-	@cp -f "share/C-RED2_SFNC_MAPPING.md" "$(DESTDIR)/share/"
-	@cp -f "include/clprotocol_cred2_xml.h" "$(DESTDIR)/share/"
+	@mkdir -p "$(DESTDIR)/$(CLPROTOCOL_PLATFORM_SUBDIR)" "$(DESTDIR)/bin"
+	@cp -f "$(TARGET)" "$(DESTDIR)/$(CLPROTOCOL_PLATFORM_SUBDIR)/"
+	@cp -f "share/C-RED2_GenApi.xml" "$(DESTDIR)/"
+	@cp -f "share/C-RED2_SFNC_MAPPING.md" "$(DESTDIR)/"
+	@cp -f "include/clprotocol_cred2_xml.h" "$(DESTDIR)/"
 	@cp -f "scripts/gen_embed_xml.sh" "$(DESTDIR)/bin/"
-	@echo "Installed $(TARGET) to $(DESTDIR)/lib"
+	@echo "Installed $(TARGET) to $(DESTDIR)/$(CLPROTOCOL_PLATFORM_SUBDIR)"
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
